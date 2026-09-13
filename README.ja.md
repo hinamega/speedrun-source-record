@@ -33,18 +33,22 @@ LiveSplitと連動し、タイマーの開始・終了に合わせてゲーム�
 ### 1. LiveSplit側の設定
 本プラグインは LiveSplit の TCP サーバー機能（既定ポート: 16834）と通信します。お使いの LiveSplit のバージョンに応じて以下の手順で準備してください。
 
-#### 通常の公式リリース版（LiveSplit 1.8.x）をお使いの場合
+#### LiveSplit 1.8.29 以降、または開発版（DevBuild）をお使いの場合（推奨）
+1. LiveSplit 1.8.29 以降には TCP サーバー機能が標準で内蔵されているため、追加プラグインの導入は不要です。
+2. LiveSplit 上で右クリック -> `Control` -> `Start TCP Server`（または `Start Server`）を選択してサーバーを開始します（既定ポート: 16834）。
+
+> [!WARNING]
+> **旧プラグイン（LiveSplit.Server）との競合にご注意ください**  
+> サーバー機能の内蔵化に伴い、従来のプラグイン `LiveSplit.Server` は非推奨となっています。1.8.29 以降の環境で `Components/LiveSplit.Server.dll` が残っていると、サーバーの多重起動や競合による不具合の原因になります。導入済みの場合は必ず `LiveSplit.Server.dll` を削除してください。
+
+#### LiveSplit 1.8.28 以前の旧バージョンをお使いの場合
 1. [LiveSplit.Server のリリースページ](https://github.com/LiveSplit/LiveSplit.Server/releases) から最新の `LiveSplit.Server.zip` をダウンロードします。
 2. 解凍したファイル（`LiveSplit.Server.dll` 等）を LiveSplit インストール先の `Components` フォルダに配置します。
 3. LiveSplit を起動し、右クリック -> `Edit Layout` -> `+` ボタン -> `Control` -> `LiveSplit Server` を追加して `OK` を押します。
 4. LiveSplit 上で右クリック -> `Control` -> `Start Server` を選択してサーバーを開始します（既定ポート: 16834）。
 
-#### 開発版（LiveSplit DevBuild）をお使いの場合
-1. 開発版にはサーバー機能が最初から内蔵されています。
-2. LiveSplit 上で右クリック -> `Control` -> `Start TCP Server` を選択してサーバーを開始します。
-
 > [!NOTE]
-> サーバー機能はどちらのバージョンでも、LiveSplit を起動するたびに手動で開始（Start）する必要があります。
+> サーバー機能はいずれのバージョンでも、LiveSplit を起動するたびに手動で開始（Start）する必要があります。
 
 ### 2. OBS Studio側の設定
 1. 録画したいゲームキャプチャや映像ソースのフィルターに「Speedrun Source Record」を追加します。

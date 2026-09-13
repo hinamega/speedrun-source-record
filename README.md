@@ -33,15 +33,19 @@ To record the microphone or a specific OBS audio track, enable **Different Audio
 ### 1. LiveSplit Setup
 This plugin communicates via LiveSplit's TCP server protocol (default port: 16834). Follow the instructions below depending on your LiveSplit version:
 
-#### Standard Release (LiveSplit 1.8.x)
+#### LiveSplit 1.8.29+, or Development Build (Recommended)
+1. LiveSplit 1.8.29 and later have the TCP server built-in natively, so no additional plugins are required.
+2. Right-click on LiveSplit -> `Control` -> `Start TCP Server` (or `Start Server`) (default port: 16834).
+
+> [!WARNING]
+> **Avoid conflict with the legacy LiveSplit.Server plugin**  
+> With the server built into LiveSplit 1.8.29+, the separate `LiveSplit.Server` plugin is deprecated. Having `Components/LiveSplit.Server.dll` present in LiveSplit 1.8.29+ can cause server conflicts or double-binding errors. If you previously installed it, please remove `LiveSplit.Server.dll` from your `Components` directory.
+
+#### LiveSplit 1.8.28 or Earlier (Legacy)
 1. Download the latest `LiveSplit.Server.zip` from the [LiveSplit.Server Releases page](https://github.com/LiveSplit/LiveSplit.Server/releases).
 2. Extract the contents (`LiveSplit.Server.dll`, etc.) into your `LiveSplit/Components/` directory.
 3. Open LiveSplit, right-click -> `Edit Layout` -> click `+` -> `Control` -> add `LiveSplit Server`, then click `OK`.
 4. Right-click on LiveSplit -> `Control` -> `Start Server` (default port: 16834).
-
-#### Development Build (LiveSplit DevBuild)
-1. The development build has the TCP server built-in.
-2. Right-click on LiveSplit -> `Control` -> `Start TCP Server` (default port: 16834).
 
 > [!NOTE]
 > Regardless of version, the server must be started manually each time you launch LiveSplit.
