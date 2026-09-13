@@ -6,8 +6,8 @@ else()
   cmake_minimum_required(VERSION 3.18)
 endif()
 
-project(source-record VERSION 0.4.8)
-set(PROJECT_FULL_NAME "Source Record")
+project(speedrun-source-record VERSION 0.5.0)
+set(PROJECT_FULL_NAME "Speedrun Source Record")
 
 # Set new UUIDs when you start to create a new plugin.
 set(MACOS_PACKAGE_UUID "3EC43C98-466F-4B74-8CB4-17B90EB0B29F")
@@ -19,7 +19,11 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/version.h.in ${CMAKE_CURRENT_SOURCE_D
 
 target_sources(${PROJECT_NAME} PRIVATE
 	source-record.c
-	source-record.h)
+	source-record.h
+	livesplit-client.c
+	livesplit-client.h
+	speedrun-concat.c
+	speedrun-concat.h)
 
 
 if(BUILD_OUT_OF_TREE)
@@ -31,6 +35,15 @@ else()
 	set(OBS_FRONTEND_API_NAME "frontend-api")
 endif()
   
+find_path(FFMPEG_AVFORMAT_INCLUDE_DIR libavformat/avformat.h)
+find_library(FFMPEG_AVFORMAT_LIB avformat)
+find_library(FFMPEG_AVCODEC_LIB avcodec)
+find_library(FFMPEG_AVUTIL_LIB avutil)
+
+if(FFMPEG_AVFORMAT_INCLUDE_DIR)
+	target_include_directories(${PROJECT_NAME} PRIVATE ${FFMPEG_AVFORMAT_INCLUDE_DIR})
+endif()
+
 if(OS_WINDOWS)
 	get_filename_component(ISS_FILES_DIR "${CMAKE_BINARY_DIR}\\..\\package" ABSOLUTE)
 	file(TO_NATIVE_PATH "${ISS_FILES_DIR}" ISS_FILES_DIR)
@@ -45,7 +58,14 @@ if(OS_WINDOWS)
 	target_sources(${PROJECT_NAME} PRIVATE 
 		${CMAKE_CURRENT_SOURCE_DIR}/${PROJECT_NAME}.rc)
 	target_link_libraries(${PROJECT_NAME}
-		w32-pthreads)
+		$<IF:$<TARGET_EXISTS:OBS::w32-pthreads>,OBS::w32-pthreads,w32-pthreads>
+		ws2_32)
+	if(FFMPEG_AVFORMAT_LIB)
+		target_link_libraries(${PROJECT_NAME}
+			${FFMPEG_AVFORMAT_LIB}
+			${FFMPEG_AVCODEC_LIB}
+			${FFMPEG_AVUTIL_LIB})
+	endif()
 elseif(OS_MACOS)
 		set(MACOS_BUNDLEID "com.exeldro.${PROJECT_NAME}")
 		set(MACOSX_PLUGIN_GUI_IDENTIFIER "${MACOS_BUNDLEID}")

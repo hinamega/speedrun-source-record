@@ -6,6 +6,8 @@
 #include <util/dstr.h>
 #include "version.h"
 #include "obs-websocket-api.h"
+#include "livesplit-client.h"
+#include "speedrun-concat.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -17,6 +19,7 @@
 #define OUTPUT_MODE_RECORDING 3
 #define OUTPUT_MODE_STREAMING_OR_RECORDING 4
 #define OUTPUT_MODE_VIRTUAL_CAMERA 5
+#define OUTPUT_MODE_LIVESPLIT 6
 
 #define BACKGROUND_CHANNEL 0
 #define SOURCE_CHANNEL 1
@@ -56,6 +59,28 @@ struct source_record_filter_context {
 	bool remove_after_record;
 	long long record_max_seconds;
 	int last_frontend_event;
+
+	/* Speedrun / LiveSplit additions */
+	livesplit_client_t *livesplit_client;
+	bool livesplit_enabled;
+	char livesplit_host[128];
+	int livesplit_port;
+	int pre_buffer_seconds;
+	int post_buffer_seconds;
+	bool move_resets_to_folder;
+	bool video_only;
+	livesplit_state_t livesplit_state;
+	livesplit_phase_t livesplit_prev_phase;
+	long long record_mode;
+	char current_recording_path[512];
+	char final_run_path[512];
+	char pre_buffer_saved_path[512];
+	bool pre_buffer_active;
+	bool pre_buffer_save_requested;
+	bool run_active;
+	bool waiting_post_buffer;
+	uint64_t finish_time_ns;
+	bool should_move_current_file;
 };
 
 DARRAY(obs_source_t *) source_record_filters;
@@ -74,7 +99,7 @@ static void run_queued(obs_task_t task, void *param)
 static const char *source_record_filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "Source Record";
+	return "Speedrun Source Record";
 }
 
 struct video_frame {
@@ -354,6 +379,14 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 
 	obs_websocket_vendor_emit_event(vendor, "replay_buffer_saved", event_data);
 	obs_data_release(event_data);
+
+	if (context->pre_buffer_save_requested && emit_path && strlen(emit_path)) {
+		snprintf(context->pre_buffer_saved_path, sizeof(context->pre_buffer_saved_path), "%s", emit_path);
+		context->pre_buffer_save_requested = false;
+		context->pre_buffer_active = true;
+		blog(LOG_INFO, "[SpeedrunSourceRecord] Pre-buffer saved to '%s'", context->pre_buffer_saved_path);
+	}
+
 	bfree(path_fallback);
 }
 
@@ -445,6 +478,18 @@ static void stop_output_sync(struct source_record_filter_context *context, obs_o
 		obs_output_force_stop(output);
 }
 
+/* Asynchronously force-stop an output via the OBS task thread. The output is
+ * released once its "stop" signal fires (see release_output_stopped). */
+static void stop_output(struct source_record_filter_context *context, obs_output_t *output)
+{
+	if (!output)
+		return;
+	struct stop_output *so = bmalloc(sizeof(struct stop_output));
+	so->output = output;
+	so->context = context;
+	run_queued(force_stop_output_task, so);
+}
+
 static const char *get_encoder_id(obs_data_t *settings)
 {
 	const char *enc_id = obs_data_get_string(settings, "encoder");
@@ -517,16 +562,141 @@ static void update_video_encoder(struct source_record_filter_context *filter, ob
 		obs_output_set_video_encoder(filter->replayOutput, filter->encoder);
 }
 
+static void sanitize_filename_part(char *dst, const char *src, size_t max_len)
+{
+	size_t j = 0;
+	for (size_t i = 0; src && src[i] && j < max_len - 1; i++) {
+		char c = src[i];
+		if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+			c = '_';
+		dst[j++] = c;
+	}
+	dst[j] = '\0';
+}
+
+static char *format_speedrun_filename(const char *fmt, const livesplit_state_t *state)
+{
+	struct dstr res;
+	dstr_init_copy(&res, fmt && *fmt ? fmt : "%game%_%category%_Run%attempt%_%CCYY-%MM-%DD_%hh-%mm-%ss");
+
+	char clean_game[256] = {0};
+	char clean_cat[256] = {0};
+	char attempt_str[32] = {0};
+
+	if (state && state->phase != LIVESPLIT_PHASE_DISCONNECTED) {
+		sanitize_filename_part(clean_game, state->game, sizeof(clean_game));
+		sanitize_filename_part(clean_cat, state->category, sizeof(clean_cat));
+		snprintf(attempt_str, sizeof(attempt_str), "%d", state->attempt_count);
+	}
+
+	if (!clean_game[0])
+		snprintf(clean_game, sizeof(clean_game), "Game");
+	if (!clean_cat[0])
+		snprintf(clean_cat, sizeof(clean_cat), "Category");
+	if (!attempt_str[0])
+		snprintf(attempt_str, sizeof(attempt_str), "1");
+
+	dstr_replace(&res, "%game%", clean_game);
+	dstr_replace(&res, "%category%", clean_cat);
+	dstr_replace(&res, "%attempt%", attempt_str);
+
+	return res.array;
+}
+
+static void on_file_output_stopped(void *data, calldata_t *cd)
+{
+	struct source_record_filter_context *filter = (struct source_record_filter_context *)data;
+	if (!filter)
+		return;
+
+	if (filter->should_move_current_file && filter->current_recording_path[0]) {
+		char src_path[512];
+		snprintf(src_path, sizeof(src_path), "%s", filter->current_recording_path);
+
+		char *last_sep = strrchr(src_path, '/');
+		if (!last_sep)
+			last_sep = strrchr(src_path, '\\');
+
+		if (last_sep) {
+			char dir[512];
+			size_t dir_len = (size_t)(last_sep - src_path);
+			memcpy(dir, src_path, dir_len);
+			dir[dir_len] = '\0';
+			const char *fname = last_sep + 1;
+
+			char reset_dir[512];
+			snprintf(reset_dir, sizeof(reset_dir), "%s/reset_runs", dir);
+			os_mkdirs(reset_dir);
+
+			char dest_path[512];
+			snprintf(dest_path, sizeof(dest_path), "%s/%s", reset_dir, fname);
+
+			blog(LOG_INFO, "[SpeedrunSourceRecord] Reset detected: Moving reset run file to '%s'", dest_path);
+			if (os_rename(src_path, dest_path) != 0) {
+				blog(LOG_WARNING, "[SpeedrunSourceRecord] Failed to move reset run file to '%s'", dest_path);
+			}
+		}
+
+		/* Clean up unused pre-buffer clip on reset */
+		if (filter->pre_buffer_saved_path[0]) {
+			os_unlink(filter->pre_buffer_saved_path);
+			filter->pre_buffer_saved_path[0] = '\0';
+		}
+		filter->pre_buffer_active = false;
+		filter->final_run_path[0] = '\0';
+		filter->should_move_current_file = false;
+		filter->current_recording_path[0] = '\0';
+
+	} else if (filter->current_recording_path[0]) {
+		/* Normal completion: stitch pre-buffer and main run if pre-buffer is active */
+		if (filter->pre_buffer_active && filter->pre_buffer_saved_path[0] && filter->final_run_path[0]) {
+			blog(LOG_INFO,
+			     "[SpeedrunSourceRecord] Run Completed! Stitching pre-buffer ('%s') and main run ('%s') -> '%s'...",
+			     filter->pre_buffer_saved_path, filter->current_recording_path, filter->final_run_path);
+			speedrun_concat_files_async(filter->pre_buffer_saved_path, filter->current_recording_path,
+						    filter->final_run_path, true, NULL, NULL);
+			filter->pre_buffer_saved_path[0] = '\0';
+			filter->pre_buffer_active = false;
+			filter->final_run_path[0] = '\0';
+		}
+		filter->current_recording_path[0] = '\0';
+	}
+	UNUSED_PARAMETER(cd);
+}
+
 static void start_file_output(struct source_record_filter_context *filter, obs_data_t *settings)
 {
 	obs_data_t *s = obs_data_create();
 	char path[512];
 	const char *format = obs_data_get_string(settings, "rec_format");
-	char *filename =
-		os_generate_formatted_filename(GetFormatExt(format), true, obs_data_get_string(settings, "filename_formatting"));
+	const char *raw_fmt = obs_data_get_string(settings, "filename_formatting");
+
+	char *speedrun_fmt = format_speedrun_filename(raw_fmt, &filter->livesplit_state);
+	char *filename = os_generate_formatted_filename(GetFormatExt(format), true, speedrun_fmt);
+	bfree(speedrun_fmt);
+
 	snprintf(path, 512, "%s/%s", obs_data_get_string(settings, "path"), filename);
 	bfree(filename);
 	ensure_directory(path);
+
+	filter->final_run_path[0] = '\0';
+
+	/* If LiveSplit mode with pre-buffer is active, record main run to a temporary path */
+	if (filter->record_mode == OUTPUT_MODE_LIVESPLIT && filter->pre_buffer_seconds > 0) {
+		snprintf(filter->final_run_path, sizeof(filter->final_run_path), "%s", path);
+		char *dot = strrchr(path, '.');
+		if (dot) {
+			char ext[32];
+			snprintf(ext, sizeof(ext), "%s", dot);
+			snprintf(dot, sizeof(path) - (size_t)(dot - path), "_main%s", ext);
+		} else {
+			strncat(path, "_main", sizeof(path) - strlen(path) - 1);
+		}
+	}
+
+	snprintf(filter->current_recording_path, sizeof(filter->current_recording_path), "%s", path);
+	filter->should_move_current_file = false;
+
 	obs_data_set_string(s, "path", path);
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
 	obs_data_set_string(s, "format", obs_data_get_string(settings, "filename_formatting"));
@@ -544,8 +714,11 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
+
+		signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
+		signal_handler_connect(sh, "stop", on_file_output_stopped, filter);
+
 		if (filter->remove_after_record) {
-			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
 			signal_handler_connect(sh, "stop", remove_filter, filter);
 		}
 	} else {
@@ -556,12 +729,19 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 		update_video_encoder(filter, settings);
 		obs_output_set_video_encoder(filter->fileOutput, filter->encoder);
 	}
-	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-		if (!filter->audioEncoder[i])
-			continue;
 
-		obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
-		obs_output_set_audio_encoder(filter->fileOutput, filter->audioEncoder[i], i);
+	if (!filter->video_only) {
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+			if (!filter->audioEncoder[i])
+				continue;
+
+			obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
+			obs_output_set_audio_encoder(filter->fileOutput, filter->audioEncoder[i], i);
+		}
+	} else {
+		/* Drop any audio encoders a previous non-video-only start attached. */
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++)
+			obs_output_set_audio_encoder(filter->fileOutput, NULL, i);
 	}
 
 	filter->starting_file_output = true;
@@ -655,10 +835,25 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 	obs_data_t *s = obs_data_create();
 
 	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
-	obs_data_set_string(s, "format", obs_data_get_string(settings, "replay_filename_formatting"));
+
+	if (filter->record_mode == OUTPUT_MODE_LIVESPLIT && filter->pre_buffer_seconds > 0) {
+		const char *raw_fmt = obs_data_get_string(settings, "filename_formatting");
+		char *speedrun_fmt = format_speedrun_filename(raw_fmt, &filter->livesplit_state);
+		struct dstr pre_fmt;
+		dstr_init_copy(&pre_fmt, speedrun_fmt);
+		dstr_cat(&pre_fmt, "_pre");
+		obs_data_set_string(s, "format", pre_fmt.array);
+		dstr_free(&pre_fmt);
+		bfree(speedrun_fmt);
+
+		filter->replay_buffer_duration = filter->pre_buffer_seconds;
+	} else {
+		obs_data_set_string(s, "format", obs_data_get_string(settings, "replay_filename_formatting"));
+		filter->replay_buffer_duration = obs_data_get_int(settings, "replay_duration");
+	}
+
 	obs_data_set_string(s, "extension", GetFormatExt(obs_data_get_string(settings, "rec_format")));
 	obs_data_set_bool(s, "allow_spaces", true);
-	filter->replay_buffer_duration = obs_data_get_int(settings, "replay_duration");
 	obs_data_set_int(s, "max_time_sec", filter->replay_buffer_duration);
 	obs_data_set_int(s, "max_size_mb", 10000);
 	if (!filter->replayOutput) {
@@ -690,13 +885,18 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 	if (filter->encoder) {
 		update_video_encoder(filter, settings);
 	}
-	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
-		if (!filter->audioEncoder[i])
-			continue;
-		obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
+	if (!filter->video_only) {
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+			if (!filter->audioEncoder[i])
+				continue;
+			obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
 
-		if (obs_output_get_audio_encoder(filter->replayOutput, i) != filter->audioEncoder[i])
-			obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
+			if (obs_output_get_audio_encoder(filter->replayOutput, i) != filter->audioEncoder[i])
+				obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
+		}
+	} else {
+		for (int i = 0; i < MAX_AUDIO_MIXES; i++)
+			obs_output_set_audio_encoder(filter->replayOutput, NULL, i);
 	}
 
 	filter->starting_replay_output = true;
@@ -862,7 +1062,7 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 			if (filter->audio_output)
 				obs_encoder_set_audio(filter->audioEncoder[i], filter->audio_output);
 
-			if (filter->fileOutput)
+			if (filter->fileOutput && !filter->video_only)
 				obs_output_set_audio_encoder(filter->fileOutput, filter->audioEncoder[i], i);
 			if (filter->replayOutput)
 				obs_output_set_audio_encoder(filter->replayOutput, filter->audioEncoder[i], i);
@@ -896,8 +1096,44 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	}
 	filter->remove_after_record = obs_data_get_bool(settings, "remove_after_record");
 	filter->record_max_seconds = obs_data_get_int(settings, "record_max_seconds");
+
+	/* Speedrun / LiveSplit config sync */
+	filter->livesplit_enabled = obs_data_get_bool(settings, "speedrun_enabled");
+	const char *host = obs_data_get_string(settings, "livesplit_host");
+	int port = (int)obs_data_get_int(settings, "livesplit_port");
+	if (port <= 0)
+		port = 16834;
+	filter->pre_buffer_seconds = (int)obs_data_get_int(settings, "pre_buffer_seconds");
+	filter->post_buffer_seconds = (int)obs_data_get_int(settings, "post_buffer_seconds");
+	filter->move_resets_to_folder = obs_data_get_bool(settings, "move_resets_to_folder");
+	filter->video_only = obs_data_get_bool(settings, "speedrun_video_only");
+
+	if (filter->livesplit_enabled) {
+		if (!filter->livesplit_client || strcmp(filter->livesplit_host, host ? host : "") != 0 ||
+		    filter->livesplit_port != port) {
+			if (filter->livesplit_client)
+				livesplit_client_destroy(filter->livesplit_client);
+
+			snprintf(filter->livesplit_host, sizeof(filter->livesplit_host), "%s", host && *host ? host : "127.0.0.1");
+			filter->livesplit_port = port;
+			filter->livesplit_prev_phase = LIVESPLIT_PHASE_DISCONNECTED;
+			/* No callback: the worker thread only maintains its own
+			 * mutex-protected snapshot. The OBS thread polls it from
+			 * source_record_filter_tick() and drives all output
+			 * lifecycle so no OBS API is called off-thread. */
+			filter->livesplit_client =
+				livesplit_client_create(filter->livesplit_host, filter->livesplit_port, NULL, NULL);
+		}
+	} else if (filter->livesplit_client) {
+		livesplit_client_destroy(filter->livesplit_client);
+		filter->livesplit_client = NULL;
+	}
+
 	const long long record_mode = obs_data_get_int(settings, "record_mode");
 	const long long stream_mode = obs_data_get_int(settings, "stream_mode");
+	filter->record_mode = record_mode;
+	if (record_mode != OUTPUT_MODE_LIVESPLIT)
+		filter->waiting_post_buffer = false;
 	const bool replay_buffer = obs_data_get_bool(settings, "replay_buffer") && !filter->closing;
 	if (!filter->closing && (record_mode != OUTPUT_MODE_NONE || stream_mode != OUTPUT_MODE_NONE || replay_buffer)) {
 		update_encoder(filter, settings);
@@ -919,6 +1155,11 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			  filter->last_frontend_event != OBS_FRONTEND_EVENT_RECORDING_STOPPED);
 	} else if (record_mode == OUTPUT_MODE_VIRTUAL_CAMERA) {
 		record = obs_frontend_virtualcam_active() && filter->last_frontend_event != OBS_FRONTEND_EVENT_VIRTUALCAM_STOPPED;
+	} else if (record_mode == OUTPUT_MODE_LIVESPLIT) {
+		/* Start/stop is driven by source_record_filter_tick() on the OBS
+		 * thread so LiveSplit state and the output lifecycle stay
+		 * single-threaded. Keep whatever tick decided here. */
+		record = filter->record;
 	}
 
 	if (parent && filter->view && (record || replay_buffer)) {
@@ -1158,6 +1399,15 @@ static void source_record_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "replay_duration", 5);
 	obs_data_set_default_int(settings, "max_size_mb", 2048);
 	obs_data_set_default_int(settings, "max_time_sec", 15 * 60);
+
+	/* Speedrun defaults */
+	obs_data_set_default_bool(settings, "speedrun_enabled", true);
+	obs_data_set_default_string(settings, "livesplit_host", "127.0.0.1");
+	obs_data_set_default_int(settings, "livesplit_port", 16834);
+	obs_data_set_default_int(settings, "pre_buffer_seconds", 5);
+	obs_data_set_default_int(settings, "post_buffer_seconds", 10);
+	obs_data_set_default_bool(settings, "move_resets_to_folder", true);
+	obs_data_set_default_bool(settings, "speedrun_video_only", false);
 }
 
 static void source_record_filter_filter_remove(void *data, obs_source_t *parent);
@@ -1211,6 +1461,19 @@ static void source_record_filter_destroy(void *data)
 	struct source_record_filter_context *context = data;
 	da_erase_item(source_record_filters, &context->source);
 	context->closing = true;
+
+	/* Stop and join the LiveSplit worker first so it can never touch this
+	 * context (and no queued task can reference it) during teardown. */
+	if (context->livesplit_client) {
+		livesplit_client_destroy(context->livesplit_client);
+		context->livesplit_client = NULL;
+	}
+
+	if (context->pre_buffer_saved_path[0]) {
+		os_unlink(context->pre_buffer_saved_path);
+		context->pre_buffer_saved_path[0] = '\0';
+	}
+
 	if (context->output_active) {
 		obs_source_t *parent = obs_filter_get_parent(context->source);
 		if (parent)
@@ -1369,6 +1632,121 @@ static void source_record_filter_tick(void *data, float seconds)
 	struct source_record_filter_context *context = data;
 	if (context->closing)
 		return;
+
+	/* Poll the LiveSplit worker's snapshot and drive run recording. All of
+	 * this runs on the OBS thread; the LiveSplit worker never touches this
+	 * context, so no lock is needed around the fields below. */
+	if (context->livesplit_client) {
+		livesplit_client_get_state(context->livesplit_client, &context->livesplit_state);
+	} else {
+		context->livesplit_state.phase = LIVESPLIT_PHASE_DISCONNECTED;
+	}
+
+	if (context->record_mode == OUTPUT_MODE_LIVESPLIT) {
+		const livesplit_phase_t phase = context->livesplit_state.phase;
+		const livesplit_phase_t prev_phase = context->livesplit_prev_phase;
+
+		if (phase != prev_phase) {
+			if (phase == LIVESPLIT_PHASE_RUNNING) {
+				context->run_active = true;
+				context->waiting_post_buffer = false;
+				context->should_move_current_file = false;
+				blog(LOG_INFO, "[SpeedrunSourceRecord] LiveSplit Run Started (Run #%d: '%s' - '%s').",
+				     context->livesplit_state.attempt_count, context->livesplit_state.game,
+				     context->livesplit_state.category);
+
+				/* If pre-buffer is enabled and standby replay buffer is running, save the pre-buffer clip */
+				if (context->pre_buffer_seconds > 0 && context->replayOutput &&
+				    obs_output_active(context->replayOutput)) {
+					context->pre_buffer_save_requested = true;
+					proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+					if (ph) {
+						proc_handler_call(ph, "save", NULL);
+					}
+				}
+			} else if (phase == LIVESPLIT_PHASE_PAUSED) {
+				/* Keep recording / run_active as-is while paused. */
+			} else if (phase == LIVESPLIT_PHASE_ENDED) {
+				context->run_active = false;
+				context->should_move_current_file = false;
+				if (context->fileOutput && context->post_buffer_seconds > 0) {
+					blog(LOG_INFO,
+					     "[SpeedrunSourceRecord] LiveSplit Run Finished! Waiting %d seconds post-buffer...",
+					     context->post_buffer_seconds);
+					context->waiting_post_buffer = true;
+					context->finish_time_ns = os_gettime_ns();
+				}
+			} else if (phase == LIVESPLIT_PHASE_NOT_RUNNING) {
+				if (context->run_active && context->move_resets_to_folder) {
+					blog(LOG_INFO,
+					     "[SpeedrunSourceRecord] Reset during run. Moving reset run to 'reset_runs'.");
+					context->should_move_current_file = true;
+				}
+				/* Clean up any captured pre-buffer clip from aborted run */
+				if (context->pre_buffer_saved_path[0]) {
+					os_unlink(context->pre_buffer_saved_path);
+					context->pre_buffer_saved_path[0] = '\0';
+				}
+				context->pre_buffer_active = false;
+				context->pre_buffer_save_requested = false;
+				context->run_active = false;
+				context->waiting_post_buffer = false;
+			} else { /* DISCONNECTED */
+				if (context->pre_buffer_saved_path[0]) {
+					os_unlink(context->pre_buffer_saved_path);
+					context->pre_buffer_saved_path[0] = '\0';
+				}
+				context->pre_buffer_active = false;
+				context->pre_buffer_save_requested = false;
+				context->run_active = false;
+				context->waiting_post_buffer = false;
+			}
+			context->livesplit_prev_phase = phase;
+		}
+
+		/* Manage pre-buffer standby replay buffer during NOT_RUNNING */
+		if (phase == LIVESPLIT_PHASE_NOT_RUNNING && context->pre_buffer_seconds > 0 &&
+		    obs_source_enabled(context->source) && context->video_output && !context->closing) {
+			if (!context->replayOutput && !context->starting_replay_output) {
+				obs_data_t *settings = obs_source_get_settings(context->source);
+				start_replay_output(context, settings);
+				obs_data_release(settings);
+			}
+		} else if (phase != LIVESPLIT_PHASE_NOT_RUNNING && context->pre_buffer_seconds > 0) {
+			/* Once the run starts or disconnects, stop standby replay buffer to conserve resources */
+			if (context->replayOutput && !context->pre_buffer_save_requested) {
+				stop_output(context, context->replayOutput);
+				context->replayOutput = NULL;
+			}
+		}
+
+		if (context->waiting_post_buffer && context->fileOutput) {
+			const uint64_t now = os_gettime_ns();
+			if (now >= context->finish_time_ns +
+					  (uint64_t)context->post_buffer_seconds * 1000000000ULL) {
+				blog(LOG_INFO,
+				     "[SpeedrunSourceRecord] Post-buffer elapsed (%d seconds). Stopping run recording.",
+				     context->post_buffer_seconds);
+				context->waiting_post_buffer = false;
+			}
+		}
+
+		const bool want_record =
+			(phase == LIVESPLIT_PHASE_RUNNING || phase == LIVESPLIT_PHASE_PAUSED) || context->waiting_post_buffer;
+		if (want_record && !context->record && !context->fileOutput && obs_source_enabled(context->source) &&
+		    context->video_output) {
+			obs_data_t *settings = obs_source_get_settings(context->source);
+			start_file_output(context, settings);
+			obs_data_release(settings);
+			context->record = true;
+		} else if (!want_record && context->record) {
+			if (context->fileOutput) {
+				stop_output(context, context->fileOutput);
+				context->fileOutput = NULL;
+			}
+			context->record = false;
+		}
+	}
 
 	obs_source_t *parent = obs_filter_get_parent(context->source);
 	if (!parent)
@@ -1674,6 +2052,7 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	obs_property_list_add_int(p, obs_module_text("Recording"), OUTPUT_MODE_RECORDING);
 	obs_property_list_add_int(p, obs_module_text("StreamingOrRecording"), OUTPUT_MODE_STREAMING_OR_RECORDING);
 	obs_property_list_add_int(p, obs_module_text("VirtualCamera"), OUTPUT_MODE_VIRTUAL_CAMERA);
+	obs_property_list_add_int(p, obs_module_text("LiveSplit"), OUTPUT_MODE_LIVESPLIT);
 
 	obs_properties_add_path(record, "path", obs_module_text("Path"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(record, "filename_formatting", obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
@@ -1699,14 +2078,28 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	p = obs_properties_add_int(split_file, "max_size_mb",
 				   obs_frontend_get_locale_string("Basic.Settings.Output.SplitFile.Size"), 0, 1073741824, 1);
 	obs_property_int_set_suffix(p, " MB");
-	obs_properties_add_button(split_file, "split_file_now", obs_frontend_get_locale_string("Basic.Main.SplitFile"),
-				 source_record_split_button);
+	obs_properties_add_button2(split_file, "split_file_now", obs_frontend_get_locale_string("Basic.Main.SplitFile"),
+				  source_record_split_button, NULL);
 	obs_properties_add_group(record, "split_file", obs_frontend_get_locale_string("Basic.Settings.Output.EnableSplitFile"),
 				 OBS_GROUP_CHECKABLE, split_file);
 
 	obs_properties_add_int(record, "record_max_seconds", obs_module_text("MaxSeconds"), 0, 31536000, 1);
 
 	obs_properties_add_group(props, "record", obs_module_text("Record"), OBS_GROUP_NORMAL, record);
+
+	/* Speedrun Settings Group */
+	obs_properties_t *speedrun = obs_properties_create();
+	obs_properties_add_bool(speedrun, "speedrun_enabled", obs_module_text("EnableLiveSplitSync"));
+	obs_properties_add_text(speedrun, "livesplit_host", obs_module_text("LiveSplitHost"), OBS_TEXT_DEFAULT);
+	obs_properties_add_int(speedrun, "livesplit_port", obs_module_text("LiveSplitPort"), 1, 65535, 1);
+	p = obs_properties_add_int(speedrun, "pre_buffer_seconds", obs_module_text("PreBufferDuration"), 0, 120, 1);
+	obs_property_int_set_suffix(p, " s");
+	p = obs_properties_add_int(speedrun, "post_buffer_seconds", obs_module_text("PostBufferDuration"), 0, 120, 1);
+	obs_property_int_set_suffix(p, " s");
+	obs_properties_add_bool(speedrun, "move_resets_to_folder", obs_module_text("MoveResetsToFolder"));
+	obs_properties_add_bool(speedrun, "speedrun_video_only", obs_module_text("VideoOnly"));
+
+	obs_properties_add_group(props, "speedrun", obs_module_text("SpeedrunSettings"), OBS_GROUP_NORMAL, speedrun);
 
 	obs_properties_t *replay = obs_properties_create();
 
@@ -1881,8 +2274,9 @@ static obs_properties_t *source_record_filter_properties(void *data)
 
 	obs_properties_add_text(
 		props, "plugin_info",
-		"<a href=\"https://obsproject.com/forum/resources/source-record.1285/\">Source Record</a> (" PROJECT_VERSION
-		") by <a href=\"https://www.exeldro.com\">Exeldro</a>",
+		"<b>Speedrun Source Record</b> (" PROJECT_VERSION ")<br>"
+		"LiveSplit integrated recording filter for speedrunners.<br>"
+		"Forked from <a href=\"https://github.com/exeldro/obs-source-record\">Source Record</a> by <a href=\"https://www.exeldro.com\">Exeldro</a>",
 		OBS_TEXT_INFO);
 	return props;
 }
@@ -1905,8 +2299,8 @@ static void source_record_filter_filter_remove(void *data, obs_source_t *parent)
 	obs_frontend_remove_event_callback(frontend_event, context);
 }
 
-struct obs_source_info source_record_filter_info = {
-	.id = "source_record_filter",
+struct obs_source_info speedrun_source_record_filter_info = {
+	.id = "speedrun_source_record_filter",
 	.type = OBS_SOURCE_TYPE_FILTER,
 	.output_flags = OBS_SOURCE_VIDEO,
 	.get_name = source_record_filter_get_name,
@@ -1923,17 +2317,17 @@ struct obs_source_info source_record_filter_info = {
 };
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("source-record", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("speedrun-source-record", "en-US")
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Source Record Filter";
+	return "Speedrun Source Record Filter (LiveSplit synced)";
 }
 
 static void find_filter(obs_source_t *parent, obs_source_t *child, void *param)
 {
 	UNUSED_PARAMETER(parent);
 	const char *id = obs_source_get_unversioned_id(child);
-	if (strcmp(id, "source_record_filter") != 0)
+	if (strcmp(id, "speedrun_source_record_filter") != 0 && strcmp(id, "source_record_filter") != 0)
 		return;
 	obs_source_t **filter = param;
 	*filter = child;
@@ -2599,12 +2993,12 @@ static void websocket_stop_stream(obs_data_t *request_data, obs_data_t *response
 
 bool obs_module_load(void)
 {
-	blog(LOG_INFO, "[Source Record] loaded version %s", PROJECT_VERSION);
-	obs_register_source(&source_record_filter_info);
+	blog(LOG_INFO, "[Speedrun Source Record] loaded version %s", PROJECT_VERSION);
+	obs_register_source(&speedrun_source_record_filter_info);
 
 	da_init(source_record_filters);
 
-	vendor = obs_websocket_register_vendor("source-record");
+	vendor = obs_websocket_register_vendor("speedrun-source-record");
 	obs_websocket_vendor_register_request(vendor, "record_start", websocket_start_record, NULL);
 	obs_websocket_vendor_register_request(vendor, "record_pause", websocket_pause_record, NULL);
 	obs_websocket_vendor_register_request(vendor, "record_unpause", websocket_unpause_record, NULL);
@@ -2643,5 +3037,5 @@ void obs_module_unload(void)
 
 const char *obs_module_name(void)
 {
-	return obs_module_text("SourceRecord");
+	return obs_module_text("SpeedrunSourceRecord");
 }
